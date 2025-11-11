@@ -1,0 +1,30 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Model checkpoints
+models/*.pt
+models/*.pth
+
+# Intermediate outputs and logs
+outputs/*.csv
+outputs/*.pkl
+*.json
+*.txt
+*.log
+
+# Data files (private or heavy)
+data/*.pkl
+data/*.csv
+
+# Environment and Jupyter
+venv/
+.env/
+.ipynb_checkpoints/
+*.ipynb
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+

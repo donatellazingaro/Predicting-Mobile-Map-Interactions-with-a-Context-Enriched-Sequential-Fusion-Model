@@ -1,0 +1,64 @@
+# ---- Standard Python template ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+htmlcov/
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.pytest_cache/
+*.log
+local_settings.py
+db.sqlite3
+instance/
+.webassets-cache
+docs/_build/
+target/
+profile_default/
+.python-version
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.spyderproject
+.spyproject
+.ropeproject
+.mypy_cache/
+.pyre/
+.pytype/
+cython_debug/
+
+# # ---- LSTM project specific ----
+# models/*.pt
+# *.json
+# *.txt
+# data/*.pkl
+# checkpoints/
+# runs/
+# logs/
+# .ipynb_checkpoints/
+# .vscode/
+
+# Ignore model outputs
+*.pt
+*.json
+
+# Ignore OS trash
+.DS_Store
