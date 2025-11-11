@@ -1,1 +1,9 @@
+__pycache__/
+*.pkl
+*.pt
+*.npz
+*.log
 .DS_Store
+outputs/
+data/
+
