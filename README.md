@@ -195,23 +195,4 @@ find . -name "*.pyc" -delete
 Pull requests should include:
 * Summary of the modification  
 * Validation metrics (dev + test)  
-* Notes on updated artifact paths  
-
----
-
-## Citation
-
-If you use this code or its datasets, please cite:
-
-```bibtex
-@misc{zingaro2025fusion,
-  title  = {Predicting Mobile Map Interactions with a Context-Enriched Sequential Fusion Model},
-  author = {Zingaro, Donatella and collaborators},
-  year   = {2025},
-  note   = {GitHub repository},
-  howpublished = {\url{https://github.com/donatellazingaro/Predicting-Mobile-Map-Interactions-with-a-Context-Enriched-Sequential-Fusion-Model}}
-}
-```
-
-
----
+* Notes on updated artifact paths
