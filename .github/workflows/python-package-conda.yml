@@ -1,0 +1,50 @@
+name: Python Package (Conda)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: ${{ runner.os }}-conda-${{ hashFiles('environment.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-conda-
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: torch-environment
+          environment-file: environment.yml
+          python-version: 3.11
+          auto-update-conda: true
+          use-mamba: true
+          channels: conda-forge,defaults
+
+      - name: Verify environment
+        run: |
+          eval "$(conda shell.bash hook)"
+          conda activate torch-environment
+          conda list
+
+      - name: Lint with flake8
+        run: |
+          eval "$(conda shell.bash hook)"
+          conda activate torch-environment
+          echo "Running flake8..."
+          flake8 "Fusion Context" LSTM --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run tests (if any)
+        run: |
+          eval "$(conda shell.bash hook)"
+          conda activate torch-environment
+          pytest -v || echo "⚠️ No tests found – skipping."

@@ -1,0 +1,46 @@
+name: torch-environment
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # --- Core Python ---
+  - python=3.11
+
+  # --- Scientific stack ---
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - scipy=1.13.1
+  - scikit-learn=1.5.2
+  - statsmodels=0.14.2
+  - matplotlib>=3.8,<3.10
+  - seaborn=0.13.2
+
+  # --- Geospatial / network analysis ---
+  - geopandas=0.14.3
+  - shapely=2.0.4
+  - osmnx=1.9.4
+  - networkx=3.2.1
+
+  # --- ML / Deep Learning ---
+  - pytorch=2.3.*
+  - cpuonly  # change to cudatoolkit if GPU support is needed
+
+  # --- Probabilistic modeling / explainability ---
+  - pymc=5.15.1
+  - arviz=0.18.0
+  - shap=0.45.0
+
+  # --- Scalability / I/O ---
+  - dask=2024.5.1
+  - pyarrow=14.0.2
+
+  # --- Dev tools ---
+  - flake8=6.1.0
+  - black=24.8.0
+  - pytest=7.4.0
+
+  # --- Pip extras ---
+  - pip
+  - pip:
+      - torchsummary
+      - tqdm
