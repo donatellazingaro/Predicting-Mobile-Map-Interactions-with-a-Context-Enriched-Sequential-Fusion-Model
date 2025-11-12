@@ -45,20 +45,21 @@ venv.bak/
 .pytype/
 cython_debug/
 
-# # ---- LSTM project specific ----
-# models/*.pt
-# *.json
-# *.txt
-# data/*.pkl
-# checkpoints/
-# runs/
-# logs/
-# .ipynb_checkpoints/
-# .vscode/
+# ---- LSTM project specific ----
+models/
+checkpoints/
+runs/
+logs/
+.ipynb_checkpoints/
+.vscode/
 
-# Ignore model outputs
+# Ignore model outputs but keep data & configs
 *.pt
 *.json
 
-# Ignore OS trash
+# ---- Allow Pickle Data (override ignores) ----
+!LSTM/data/*.pkl
+!Fusion Context/data/*.pkl
+
+# ---- OS trash ----
 .DS_Store

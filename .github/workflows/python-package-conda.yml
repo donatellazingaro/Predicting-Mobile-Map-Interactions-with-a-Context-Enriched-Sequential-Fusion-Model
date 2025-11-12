@@ -12,6 +12,11 @@ jobs:
       # ----------------- 1. Checkout -----------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          lfs: true  # 👈 fetch Git LFS files, not just pointers
+
+      - name: Pull LFS files
+        run: git lfs pull  # 👈 ensure large .pkl files are actually downloaded
 
       # ----------------- 2. Cache Conda -----------------
       - name: Cache Conda packages
