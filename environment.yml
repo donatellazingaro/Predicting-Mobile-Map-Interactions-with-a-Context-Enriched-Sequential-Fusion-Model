@@ -36,10 +36,8 @@ dependencies:
   - pyarrow=14.0.2
 
   # --- Configuration / validation ---
-  - pydantic>=2.0
-  - pydantic-settings>=2.0
+  - pydantic=1.10.14
   
-
   # --- Dev tools ---
   - flake8=6.1.0
   - black=24.8.0
