@@ -1,67 +1,67 @@
-#!filepath projects/computational/LSTM/augmentation_sweep.py
 from __future__ import annotations
-import itertools
+import glob
 import json
 import logging
 import os
 import pickle
 import random
+import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch  # type: ignore
 import torch.nn as nn  # type: ignore
-from pydantic import BaseSettings, PositiveFloat, PositiveInt, validator  # type: ignore
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler  # type: ignore
+
+# --- Handle both Pydantic v1 and v2 safely ---
+try:
+    from pydantic import PositiveInt, validator  # type: ignore
+    from pydantic_settings import BaseSettings  # type: ignore
+except ImportError:
+    from pydantic import BaseSettings, PositiveInt, validator  # type: ignore
 
 from sklearn.metrics import (  # type: ignore
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
-    average_precision_score,
     roc_auc_score,
 )
+from torch.utils.data import DataLoader, TensorDataset  # type: ignore
+
+
+# ---------------------------------------------------------------------
+# Directories and configuration
+# ---------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
-    """Configuration for augmentation sweep."""
+    """Evaluate saved augmentation models at a fixed operating point."""
 
-    # Paths
-    data_dir: str = "projects/computational/LSTM/data"
-    models_dir: str = "projects/computational/LSTM/models"
-    sweep_summary_path: str = "projects/computational/LSTM/augmentation_sweep_results.json"
+    # Paths (made relative for portability)
+    data_dir: str = str(BASE_DIR / "data")
+    models_dir: str = str(BASE_DIR / "models")
+    results_json: str = str(BASE_DIR / "all_test_results.json")
+    thresholds_txt: str = str(BASE_DIR / "threshold_analysis.txt")
 
-    # Data files
     cfg_pickle: str = "training_config_clean.pkl"
-    train_pickle: str = "train_sessions_processed.pkl"
-    dev_pickle: str = "dev_sessions_processed.pkl"
+    test_pickle: str = "test_sessions_processed.pkl"
 
-    # Training
-    seed: int = 42
-    batch_size: PositiveInt = 32
-    lr: PositiveFloat = 1e-4
-    max_epochs: PositiveInt = 16
-    patience: PositiveInt = 6
     window_length: PositiveInt = 10
-    sampler_multiplier: PositiveFloat = 1.25
-    sampler_cap: PositiveInt = 8_000_000
+    batch_size: PositiveInt = 128
 
-    # Model
-    in_channels_from_config_key: str = "stoi"
-    hidden_channels: PositiveInt = 16
-    num_layers: PositiveInt = 3
-    lstm_dropout: float = 0.3
+    # Filenames like best_{mask}_{noise}_{drop}.pt
+    filename_pattern: str = r"best_(\d*\.?\d+)_(\d*\.?\d+)_(\d*\.?\d+)\.pt"
 
-    # Augmentation grids
-    mask_probs: Tuple[float, ...] = (0.05, 0.1, 0.15, 0.2)
-    noise_stds: Tuple[float, ...] = (0.05, 0.1, 0.15, 0.2, 0.3)
-    feat_drop_probs: Tuple[float, ...] = (0.0, 0.05, 0.1, 0.15)
+    # Operating threshold τ
+    fixed_threshold: float = 0.80
 
-    # Selection
-    fixed_threshold: float = 0.80  # operating point τ
-
+    seed: int = 42
     log_level: str = "INFO"
 
     @validator("log_level")
@@ -72,6 +72,9 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
 def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
@@ -101,31 +104,12 @@ def safe_load_pickle(path: str):
         raise RuntimeError(f"Could not load pickle: {path}") from e
 
 
-def ensure_dirs(*paths: str) -> None:
-    for p in paths:
-        os.makedirs(p, exist_ok=True)
-
-
-def augment_window(
-    window: torch.Tensor,
-    mask_prob: float,
-    noise_std: float,
-    feature_drop_prob: float,
-) -> torch.Tensor:
-    """Apply Gaussian noise, single time-step masking, and single feature-channel dropout per window."""
-    if noise_std > 0:
-        window = window + torch.randn_like(window) * float(noise_std)
-    if mask_prob > 0 and np.random.rand() < float(mask_prob):
-        t = np.random.randint(0, window.shape[0])
-        window[t] = 0
-    if feature_drop_prob > 0 and np.random.rand() < float(feature_drop_prob):
-        f = np.random.randint(0, window.shape[1])
-        window[:, f] = 0
-    return window
-
-
+# ---------------------------------------------------------------------
+# Data preparation
+# ---------------------------------------------------------------------
 @dataclass(frozen=True)
 class Windows:
+    """[N, T, F] windows and [N] integer labels."""
     X: torch.Tensor
     y: torch.Tensor
 
@@ -133,12 +117,7 @@ class Windows:
 def extract_sliding_windows(
     session_tuples: Sequence[Tuple[torch.Tensor, int]],
     window_length: int,
-    augment: bool = False,
-    mask_prob: float = 0.0,
-    noise_std: float = 0.0,
-    feature_drop_prob: float = 0.0,
 ) -> Windows:
-    """Create fixed-length overlapping windows from variable-length sessions."""
     X_list: List[torch.Tensor] = []
     y_list: List[int] = []
     for sess, label in session_tuples:
@@ -148,22 +127,28 @@ def extract_sliding_windows(
         if T < window_length:
             continue
         for s in range(T - window_length + 1):
-            w = sess[s : s + window_length].clone()
-            if augment:
-                w = augment_window(w, mask_prob, noise_std, feature_drop_prob)
-            X_list.append(w)
+            X_list.append(sess[s : s + window_length].clone())
             y_list.append(int(label))
     if not X_list:
-        raise ValueError("No windows extracted. Check inputs or window_length.")
+        raise ValueError("No windows extracted for test set.")
     X = torch.stack(X_list, dim=0)
     y = torch.tensor(y_list, dtype=torch.long)
     return Windows(X=X, y=y)
 
 
+# ---------------------------------------------------------------------
+# Model definition
+# ---------------------------------------------------------------------
 class LstmModel(nn.Module):
-    """LSTM binary classifier producing a single logit per window."""
+    """LSTM binary classifier outputting a single logit per window."""
 
-    def __init__(self, in_channels: int, hidden_channels: int, num_layers: int, lstm_dropout: float) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 16,
+        num_layers: int = 3,
+        lstm_dropout: float = 0.3,
+    ) -> None:
         super().__init__()
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
@@ -181,216 +166,189 @@ class LstmModel(nn.Module):
         h0 = torch.zeros(self.num_layers, b, self.hidden_channels, device=x.device)
         c0 = torch.zeros(self.num_layers, b, self.hidden_channels, device=x.device)
         out, _ = self.lstm(x, (h0, c0))
-        logits = self.head(out[:, -1, :]).squeeze(-1)
-        return logits
+        return self.head(out[:, -1, :]).squeeze(-1)
 
 
-def make_loaders(
-    X_train: torch.Tensor,
-    y_train: torch.Tensor,
-    X_dev: torch.Tensor,
-    y_dev: torch.Tensor,
-    batch_size: int,
-    sampler_multiplier: float,
-    sampler_cap: int,
-) -> Tuple[DataLoader, DataLoader, Counter]:
-    counts = Counter(y_train.tolist())
-    n_pos, n_neg = counts.get(1, 0), counts.get(0, 0)
-    majority = max(n_pos, n_neg, 1)
-    target_samples = int(min(sampler_multiplier * majority, sampler_cap))
-    weights = torch.ones(len(y_train), dtype=torch.double)
-    if n_pos > 0:
-        weights[y_train == 1] = target_samples / float(max(n_pos, 1))
-    if n_neg > 0:
-        weights[y_train == 0] = target_samples / float(max(n_neg, 1))
-    sampler = WeightedRandomSampler(weights=weights, num_samples=target_samples, replacement=True)
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, sampler=sampler)
-    dev_loader = DataLoader(TensorDataset(X_dev, y_dev), batch_size=batch_size, shuffle=False)
-    return train_loader, dev_loader, counts
-
-
-@torch.no_grad()
-def dev_metrics_at_threshold(model: nn.Module, dev_loader: DataLoader, device: torch.device, thr: float) -> dict:
-    """Compute dev metrics at fixed τ plus threshold-free companions."""
+# ---------------------------------------------------------------------
+# Evaluation functions
+# ---------------------------------------------------------------------
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     y_true: List[int] = []
     y_prob: List[float] = []
-    for xb, yb in dev_loader:
-        xb = xb.to(device)
-        y_true.extend(yb.cpu().numpy().tolist())
-        y_prob.extend(torch.sigmoid(model(xb)).cpu().numpy().tolist())
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    y_bin = (y_prob >= thr).astype(int)
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True)
+            probs = torch.sigmoid(model(xb))
+            y_prob.extend(probs.detach().cpu().numpy().tolist())
+            y_true.extend(yb.detach().cpu().numpy().tolist())
+    return np.asarray(y_true), np.asarray(y_prob)
 
-    metrics = {
-        "f1_at_thr": float(f1_score(y_true, y_bin, zero_division=0)),
-        "precision_at_thr": float(precision_score(y_true, y_bin, zero_division=0)),
-        "recall_at_thr": float(recall_score(y_true, y_bin, zero_division=0)),
-        "pr_auc": float(average_precision_score(y_true, y_prob)),
-        "roc_auc": float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan"),
+
+def _safe_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int, int, int, int]:
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    if cm.shape != (2, 2):
+        tn = int(cm[0, 0]) if cm.size > 0 else 0
+        return tn, 0, 0, 0
+    tn, fp, fn, tp = cm.ravel()
+    return int(tn), int(fp), int(fn), int(tp)
+
+
+def metrics_from_probs(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> Dict[str, float]:
+    """Point metrics at τ plus threshold-free companions."""
+    y_pred = (y_prob >= thr).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    pr_auc = average_precision_score(y_true, y_prob)
+    roc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
+    tn, fp, fn, tp = _safe_confusion_matrix(y_true, y_pred)
+    return {
+        "accuracy_at_thr": float(acc),
+        "precision_at_thr": float(prec),
+        "recall_at_thr": float(rec),
+        "f1_at_thr": float(f1),
+        "pr_auc": float(pr_auc),
+        "roc_auc": float(roc),
+        "TP": float(tp),
+        "FP": float(fp),
+        "TN": float(tn),
+        "FN": float(fn),
     }
-    return metrics
 
 
-def train_one_config(
-    cfg: Settings,
-    device: torch.device,
-    train_sess: Sequence[Tuple[torch.Tensor, int]],
-    dev_sess: Sequence[Tuple[torch.Tensor, int]],
-    mask_prob: float,
-    noise_std: float,
-    feature_drop_prob: float,
-    in_channels: int,
-) -> Tuple[float, str, float, dict]:
-    """Train one augmentation triple; return selector, ckpt path, best dev loss, and dev metrics."""
-    win_train = extract_sliding_windows(
-        train_sess, cfg.window_length, augment=True, mask_prob=mask_prob, noise_std=noise_std, feature_drop_prob=feature_drop_prob
-    )
-    win_dev = extract_sliding_windows(dev_sess, cfg.window_length, augment=False)
-
-    train_loader, dev_loader, counts = make_loaders(
-        X_train=win_train.X,
-        y_train=win_train.y,
-        X_dev=win_dev.X,
-        y_dev=win_dev.y,
-        batch_size=cfg.batch_size,
-        sampler_multiplier=cfg.sampler_multiplier,
-        sampler_cap=cfg.sampler_cap,
-    )
-    n_pos, n_neg = counts.get(1, 0), counts.get(0, 0)
-
-    model = LstmModel(
-        in_channels=in_channels,
-        hidden_channels=cfg.hidden_channels,
-        num_layers=cfg.num_layers,
-        lstm_dropout=cfg.lstm_dropout,
-    ).to(device)
-
-    pos_weight = torch.tensor([float(n_neg) / float(max(n_pos, 1))], device=device)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optim = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-
-    best_dev, patience_left = float("inf"), int(cfg.patience)
-    ckpt_path = os.path.join(cfg.models_dir, f"best_{mask_prob}_{noise_std}_{feature_drop_prob}.pt")
-
-    for epoch in range(1, cfg.max_epochs + 1):
-        model.train()
-        for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.float().to(device)
-            logits = model(xb)
-            loss = loss_fn(logits, yb)
-            optim.zero_grad(set_to_none=True)
-            loss.backward()
-            optim.step()
-
-        model.eval()
-        dev_loss = 0.0
-        with torch.no_grad():
-            for xb, yb in dev_loader:
-                xb = xb.to(device)
-                yb = yb.float().to(device)
-                dev_loss += float(loss_fn(model(xb), yb).item())
-        dev_loss /= max(len(dev_loader), 1)
-        logging.info(
-            "mask=%.2f noise=%.2f drop=%.2f | epoch=%02d dev_loss=%.4f",
-            mask_prob, noise_std, feature_drop_prob, epoch, dev_loss
-        )
-
-        if dev_loss < best_dev:
-            best_dev = dev_loss
-            patience_left = cfg.patience
-            torch.save(model.state_dict(), ckpt_path)
-        else:
-            patience_left -= 1
-            if patience_left <= 0:
-                logging.info("Early stopping: mask=%.2f noise=%.2f drop=%.2f", mask_prob, noise_std, feature_drop_prob)
-                break
-
-    # Reload best and compute metrics at fixed τ
-    best_model = LstmModel(
-        in_channels=in_channels,
-        hidden_channels=cfg.hidden_channels,
-        num_layers=cfg.num_layers,
-        lstm_dropout=cfg.lstm_dropout,
-    ).to(device)
-    best_model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    devm = dev_metrics_at_threshold(best_model, dev_loader, device, thr=cfg.fixed_threshold)
-
-    selection_score = devm["f1_at_thr"]  # choose by F1 at τ; swap to precision/recall if desired
-    return selection_score, ckpt_path, best_dev, devm
+def threshold_sensitivity(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    thresholds: Iterable[float],
+) -> List[Tuple[float, float, float, float, float, float]]:
+    rows: List[Tuple[float, float, float, float, float, float]] = []
+    for thr in thresholds:
+        y_bin = (y_prob >= thr).astype(int)
+        precision = precision_score(y_true, y_bin, zero_division=0)
+        recall = recall_score(y_true, y_bin, zero_division=0)
+        f1_pos = f1_score(y_true, y_bin, zero_division=0)
+        f1_macro = f1_score(y_true, y_bin, average="macro", zero_division=0)
+        negatives = (y_true == 0)
+        specificity = float((y_bin[negatives] == 0).mean()) if negatives.any() else float("nan")
+        youden_j = (recall if np.isfinite(recall) else 0.0) + (specificity if np.isfinite(specificity) else 0.0) - 1
+        rows.append((float(thr), float(precision), float(recall), float(f1_pos), float(f1_macro), float(youden_j)))
+    return rows
 
 
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 def main() -> None:
+    """Evaluate all 'best_*.pt' models on the TEST set at τ, and sort by F1@τ."""
     cfg = Settings()
     setup_logging(cfg.log_level)
     set_seed(cfg.seed)
-    ensure_dirs(cfg.data_dir, cfg.models_dir)
     device = get_device()
     logging.info("Device: %s", device)
 
-    cfg_path = os.path.join(cfg.data_dir, cfg.cfg_pickle)
-    train_path = os.path.join(cfg.data_dir, cfg.train_pickle)
-    dev_path = os.path.join(cfg.data_dir, cfg.dev_pickle)
-
+    cfg_path = str(Path(cfg.data_dir) / cfg.cfg_pickle)
+    test_path = str(Path(cfg.data_dir) / cfg.test_pickle)
     config = safe_load_pickle(cfg_path)
-    train_sess = safe_load_pickle(train_path)
-    dev_sess = safe_load_pickle(dev_path)
+    test_sess = safe_load_pickle(test_path)
 
-    in_key = cfg.in_channels_from_config_key
-    if in_key not in config:
-        raise KeyError(f"Config missing key '{in_key}' for in_channels.")
-    in_channels = len(config[in_key])
-    logging.info("Detected input feature size (F): %d", in_channels)
+    if not isinstance(config, dict) or "stoi" not in config:
+        raise KeyError("Config pickle must contain the key 'stoi'.")
 
-    results: List[dict] = []
-    combos = list(itertools.product(cfg.mask_probs, cfg.noise_stds, cfg.feat_drop_probs))
-    logging.info("Total augmentation combinations: %d", len(combos))
-
-    for mp, ns, fd in combos:
-        sel, ckpt, best_dev, devm = train_one_config(cfg, device, train_sess, dev_sess, mp, ns, fd, in_channels)
-        row = {
-            "mask_prob": float(mp),
-            "noise_std": float(ns),
-            "feature_drop_prob": float(fd),
-            "selection_score": round(float(sel), 6),  # F1@τ
-            "best_dev_loss": round(float(best_dev), 6),
-            "ckpt": ckpt,
-            "thr": float(cfg.fixed_threshold),
-            # diagnostics
-            "dev_f1_at_thr": float(devm["f1_at_thr"]),
-            "dev_precision_at_thr": float(devm["precision_at_thr"]),
-            "dev_recall_at_thr": float(devm["recall_at_thr"]),
-            "dev_pr_auc": float(devm["pr_auc"]),
-            "dev_roc_auc": float(devm["roc_auc"]),
-        }
-        results.append(row)
-
-    # Sort by performance at the operating point (higher is better)
-    results_sorted = sorted(results, key=lambda r: r["selection_score"], reverse=True)
-
-    # Persist sweep summary
-    with open(cfg.sweep_summary_path, "w") as f:
-        json.dump(results_sorted, f, indent=2)
-
-    # Create a canonical pointer to the best model for downstream stages
-    best = results_sorted[0]
-    best_ckpt = best["ckpt"]
-    best_link = os.path.join(cfg.models_dir, "best_lstm.pt")
-    try:
-        if os.path.islink(best_link) or os.path.exists(best_link):
-            os.remove(best_link)
-        os.symlink(os.path.abspath(best_ckpt), best_link)
-    except OSError:
-        import shutil
-        shutil.copy2(best_ckpt, best_link)
-
-    logging.info(
-        "Sweep complete. Best by F1@τ=%.2f: %.4f (mask=%.2f, noise=%.2f, drop=%.2f).",
-        cfg.fixed_threshold, best["selection_score"], best["mask_prob"], best["noise_std"], best["feature_drop_prob"]
+    win_test = extract_sliding_windows(test_sess, cfg.window_length)
+    pin_mem = torch.cuda.is_available()
+    test_loader = DataLoader(
+        TensorDataset(win_test.X, win_test.y),
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        pin_memory=pin_mem,
     )
-    logging.info("Canonical best LSTM at: %s -> %s", best_link, best_ckpt)
+    logging.info(
+        "Test windows: %s | label dist: %s",
+        tuple(win_test.X.shape),
+        dict(Counter(win_test.y.tolist())),
+    )
+
+    pattern = re.compile(cfg.filename_pattern)
+    model_files = sorted(glob.glob(os.path.join(cfg.models_dir, "best_*.pt")))
+    logging.info("Found %d model files in %s", len(model_files), cfg.models_dir)
+
+    in_channels = len(config["stoi"])
+    results: List[Dict[str, float]] = []
+    last_probs: np.ndarray = np.array([])
+    last_true: np.ndarray = np.array([])
+
+    for path in model_files:
+        fname = os.path.basename(path)
+        m = pattern.search(fname)
+        if not m:
+            logging.warning("Skipping file with unexpected name: %s", fname)
+            continue
+        mask_prob, noise_std, feat_drop = map(float, m.groups())
+        logging.info(
+            "Evaluating %s (mask=%.2f noise=%.2f drop=%.2f) at τ=%.2f",
+            fname, mask_prob, noise_std, feat_drop, cfg.fixed_threshold,
+        )
+
+        model = LstmModel(
+            in_channels=in_channels,
+            hidden_channels=16,
+            num_layers=3,
+            lstm_dropout=0.3,
+        ).to(device)
+
+        try:
+            state = torch.load(path, map_location=device)
+            if isinstance(state, dict) and "state_dict" in state:
+                model.load_state_dict(state["state_dict"], strict=False)
+            elif isinstance(state, dict):
+                model.load_state_dict(state, strict=False)
+            else:
+                raise RuntimeError("Checkpoint format not recognized.")
+        except Exception:
+            logging.exception("Failed to load checkpoint: %s", path)
+            continue
+
+        y_true, y_prob = evaluate_model(model, test_loader, device)
+        metrics = metrics_from_probs(y_true, y_prob, thr=cfg.fixed_threshold)
+        metrics.update(
+            {
+                "mask_prob": float(mask_prob),
+                "noise_std": float(noise_std),
+                "feature_drop_prob": float(feat_drop),
+                "ckpt": path,
+                "threshold": float(cfg.fixed_threshold),
+            }
+        )
+        results.append(metrics)
+        last_probs, last_true = y_prob, y_true
+
+    # Sort and save metrics
+    results_sorted = sorted(results, key=lambda r: r["f1_at_thr"], reverse=True)
+    os.makedirs(os.path.dirname(cfg.results_json), exist_ok=True)
+    with open(cfg.results_json, "w") as f:
+        json.dump(results_sorted, f, indent=2)
+    logging.info("Saved metrics (sorted by F1@τ=%.2f) to %s", cfg.fixed_threshold, cfg.results_json)
+
+    # Threshold sensitivity
+    if last_probs.size > 0:
+        lo = max(0.10, cfg.fixed_threshold - 0.20)
+        hi = min(0.95, cfg.fixed_threshold + 0.20)
+        thresholds = [round(t, 2) for t in np.linspace(lo, hi, 9)]
+        rows = threshold_sensitivity(last_true, last_probs, thresholds)
+        os.makedirs(os.path.dirname(cfg.thresholds_txt), exist_ok=True)
+        with open(cfg.thresholds_txt, "w") as f:
+            f.write("thr\tprecision\trecall\tf1_pos\tf1_macro\tyouden_j\n")
+            for thr, p, r, f1p, f1m, j in rows:
+                f.write(f"{thr:.2f}\t{p:.3f}\t{r:.3f}\t{f1p:.3f}\t{f1m:.3f}\t{j:.3f}\n")
+        logging.info("Saved threshold analysis to %s (range %.2f–%.2f).", cfg.thresholds_txt, thresholds[0], thresholds[-1])
+    else:
+        logging.warning("No models evaluated; threshold analysis skipped.")
 
 
 if __name__ == "__main__":
