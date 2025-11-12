@@ -1,5 +1,6 @@
 name: torch-environment
 channels:
+  - pytorch       # add this line
   - conda-forge
   - defaults
 dependencies:
