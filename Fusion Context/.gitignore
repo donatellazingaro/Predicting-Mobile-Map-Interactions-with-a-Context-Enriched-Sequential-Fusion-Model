@@ -15,8 +15,8 @@ outputs/*.pkl
 *.log
 
 # Data files (private or heavy)
-data/*.pkl
-data/*.csv
+# data/*.pkl
+# data/*.csv
 
 # Environment and Jupyter
 venv/
