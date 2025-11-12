@@ -73,7 +73,7 @@ class Settings(BaseSettings):
 
 
 # ---------------------------------------------------------------------
-# Utilities
+# Utility functions
 # ---------------------------------------------------------------------
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -94,6 +94,7 @@ def get_device() -> torch.device:
 
 
 def safe_load_pickle(path: str):
+    """Load a pickle safely, raising FileNotFoundError if missing."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing file: {path}")
     try:
@@ -170,13 +171,9 @@ class LstmModel(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# Evaluation functions
+# Evaluation logic
 # ---------------------------------------------------------------------
-def evaluate_model(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> Tuple[np.ndarray, np.ndarray]:
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     y_true: List[int] = []
     y_prob: List[float] = []
@@ -199,7 +196,7 @@ def _safe_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int,
 
 
 def metrics_from_probs(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> Dict[str, float]:
-    """Point metrics at τ plus threshold-free companions."""
+    """Compute precision, recall, F1, PR-AUC, ROC-AUC, and confusion metrics."""
     y_pred = (y_prob >= thr).astype(int)
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
@@ -209,25 +206,21 @@ def metrics_from_probs(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> Di
     roc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
     tn, fp, fn, tp = _safe_confusion_matrix(y_true, y_pred)
     return {
-        "accuracy_at_thr": float(acc),
-        "precision_at_thr": float(prec),
-        "recall_at_thr": float(rec),
-        "f1_at_thr": float(f1),
-        "pr_auc": float(pr_auc),
-        "roc_auc": float(roc),
-        "TP": float(tp),
-        "FP": float(fp),
-        "TN": float(tn),
-        "FN": float(fn),
+        "accuracy_at_thr": acc,
+        "precision_at_thr": prec,
+        "recall_at_thr": rec,
+        "f1_at_thr": f1,
+        "pr_auc": pr_auc,
+        "roc_auc": roc,
+        "TP": tp,
+        "FP": fp,
+        "TN": tn,
+        "FN": fn,
     }
 
 
-def threshold_sensitivity(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    thresholds: Iterable[float],
-) -> List[Tuple[float, float, float, float, float, float]]:
-    rows: List[Tuple[float, float, float, float, float, float]] = []
+def threshold_sensitivity(y_true: np.ndarray, y_prob: np.ndarray, thresholds: Iterable[float]):
+    rows = []
     for thr in thresholds:
         y_bin = (y_prob >= thr).astype(int)
         precision = precision_score(y_true, y_bin, zero_division=0)
@@ -237,7 +230,7 @@ def threshold_sensitivity(
         negatives = (y_true == 0)
         specificity = float((y_bin[negatives] == 0).mean()) if negatives.any() else float("nan")
         youden_j = (recall if np.isfinite(recall) else 0.0) + (specificity if np.isfinite(specificity) else 0.0) - 1
-        rows.append((float(thr), float(precision), float(recall), float(f1_pos), float(f1_macro), float(youden_j)))
+        rows.append((thr, precision, recall, f1_pos, f1_macro, youden_j))
     return rows
 
 
@@ -245,37 +238,30 @@ def threshold_sensitivity(
 # Main
 # ---------------------------------------------------------------------
 def main() -> None:
-    """Evaluate all 'best_*.pt' models on the TEST set at τ, and sort by F1@τ."""
     cfg = Settings()
     setup_logging(cfg.log_level)
     set_seed(cfg.seed)
     device = get_device()
     logging.info("Device: %s", device)
 
-    cfg_path = str(Path(cfg.data_dir) / cfg.cfg_pickle)
-    test_path = str(Path(cfg.data_dir) / cfg.test_pickle)
-    config = safe_load_pickle(cfg_path)
-    test_sess = safe_load_pickle(test_path)
+    cfg_path = Path(cfg.data_dir) / cfg.cfg_pickle
+    test_path = Path(cfg.data_dir) / cfg.test_pickle
+    config = safe_load_pickle(str(cfg_path))
+    test_sess = safe_load_pickle(str(test_path))
 
     if not isinstance(config, dict) or "stoi" not in config:
         raise KeyError("Config pickle must contain the key 'stoi'.")
 
     win_test = extract_sliding_windows(test_sess, cfg.window_length)
-    pin_mem = torch.cuda.is_available()
     test_loader = DataLoader(
         TensorDataset(win_test.X, win_test.y),
         batch_size=cfg.batch_size,
         shuffle=False,
-        pin_memory=pin_mem,
-    )
-    logging.info(
-        "Test windows: %s | label dist: %s",
-        tuple(win_test.X.shape),
-        dict(Counter(win_test.y.tolist())),
+        pin_memory=torch.cuda.is_available(),
     )
 
     pattern = re.compile(cfg.filename_pattern)
-    model_files = sorted(glob.glob(os.path.join(cfg.models_dir, "best_*.pt")))
+    model_files = sorted(Path(cfg.models_dir).glob("best_*.pt"))
     logging.info("Found %d model files in %s", len(model_files), cfg.models_dir)
 
     in_channels = len(config["stoi"])
@@ -284,24 +270,17 @@ def main() -> None:
     last_true: np.ndarray = np.array([])
 
     for path in model_files:
-        fname = os.path.basename(path)
-        m = pattern.search(fname)
+        m = pattern.search(path.name)
         if not m:
-            logging.warning("Skipping file with unexpected name: %s", fname)
+            logging.warning("Skipping unexpected filename: %s", path.name)
             continue
         mask_prob, noise_std, feat_drop = map(float, m.groups())
         logging.info(
             "Evaluating %s (mask=%.2f noise=%.2f drop=%.2f) at τ=%.2f",
-            fname, mask_prob, noise_std, feat_drop, cfg.fixed_threshold,
+            path.name, mask_prob, noise_std, feat_drop, cfg.fixed_threshold,
         )
 
-        model = LstmModel(
-            in_channels=in_channels,
-            hidden_channels=16,
-            num_layers=3,
-            lstm_dropout=0.3,
-        ).to(device)
-
+        model = LstmModel(in_channels=in_channels).to(device)
         try:
             state = torch.load(path, map_location=device)
             if isinstance(state, dict) and "state_dict" in state:
@@ -315,38 +294,31 @@ def main() -> None:
             continue
 
         y_true, y_prob = evaluate_model(model, test_loader, device)
-        metrics = metrics_from_probs(y_true, y_prob, thr=cfg.fixed_threshold)
-        metrics.update(
-            {
-                "mask_prob": float(mask_prob),
-                "noise_std": float(noise_std),
-                "feature_drop_prob": float(feat_drop),
-                "ckpt": path,
-                "threshold": float(cfg.fixed_threshold),
-            }
-        )
+        metrics = metrics_from_probs(y_true, y_prob, cfg.fixed_threshold)
+        metrics.update({
+            "mask_prob": mask_prob,
+            "noise_std": noise_std,
+            "feature_drop_prob": feat_drop,
+            "ckpt": str(path),
+            "threshold": cfg.fixed_threshold,
+        })
         results.append(metrics)
         last_probs, last_true = y_prob, y_true
 
-    # Sort and save metrics
+    # Save results
     results_sorted = sorted(results, key=lambda r: r["f1_at_thr"], reverse=True)
-    os.makedirs(os.path.dirname(cfg.results_json), exist_ok=True)
-    with open(cfg.results_json, "w") as f:
-        json.dump(results_sorted, f, indent=2)
-    logging.info("Saved metrics (sorted by F1@τ=%.2f) to %s", cfg.fixed_threshold, cfg.results_json)
+    Path(cfg.results_json).write_text(json.dumps(results_sorted, indent=2))
+    logging.info("Saved metrics sorted by F1@τ=%.2f → %s", cfg.fixed_threshold, cfg.results_json)
 
-    # Threshold sensitivity
     if last_probs.size > 0:
-        lo = max(0.10, cfg.fixed_threshold - 0.20)
-        hi = min(0.95, cfg.fixed_threshold + 0.20)
+        lo, hi = max(0.10, cfg.fixed_threshold - 0.20), min(0.95, cfg.fixed_threshold + 0.20)
         thresholds = [round(t, 2) for t in np.linspace(lo, hi, 9)]
         rows = threshold_sensitivity(last_true, last_probs, thresholds)
-        os.makedirs(os.path.dirname(cfg.thresholds_txt), exist_ok=True)
         with open(cfg.thresholds_txt, "w") as f:
             f.write("thr\tprecision\trecall\tf1_pos\tf1_macro\tyouden_j\n")
             for thr, p, r, f1p, f1m, j in rows:
                 f.write(f"{thr:.2f}\t{p:.3f}\t{r:.3f}\t{f1p:.3f}\t{f1m:.3f}\t{j:.3f}\n")
-        logging.info("Saved threshold analysis to %s (range %.2f–%.2f).", cfg.thresholds_txt, thresholds[0], thresholds[-1])
+        logging.info("Saved threshold sensitivity to %s (range %.2f–%.2f)", cfg.thresholds_txt, thresholds[0], thresholds[-1])
     else:
         logging.warning("No models evaluated; threshold analysis skipped.")
 

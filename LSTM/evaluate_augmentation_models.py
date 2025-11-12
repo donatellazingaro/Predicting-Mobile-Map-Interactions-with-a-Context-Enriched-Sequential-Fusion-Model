@@ -3,12 +3,12 @@ from __future__ import annotations
 import glob
 import json
 import logging
-import os
 import pickle
 import random
 import re
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
@@ -27,12 +27,20 @@ from sklearn.metrics import (  # type: ignore
 from torch.utils.data import DataLoader, TensorDataset  # type: ignore
 
 
+# ---------------------------------------------------------------------
+# Directories and configuration
+# ---------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
+
 class Settings(BaseSettings):
     """Evaluate saved augmentation models at a fixed operating point."""
-    data_dir: str = "projects/computational/LSTM/data"
-    models_dir: str = "projects/computational/LSTM/models"
-    results_json: str = "projects/computational/LSTM/all_test_results.json"
-    thresholds_txt: str = "projects/computational/LSTM/threshold_analysis.txt"
+
+    # Paths are relative to the script location
+    data_dir: str = str(BASE_DIR / "data")
+    models_dir: str = str(BASE_DIR / "models")
+    results_json: str = str(BASE_DIR / "all_test_results.json")
+    thresholds_txt: str = str(BASE_DIR / "threshold_analysis.txt")
 
     cfg_pickle: str = "training_config_clean.pkl"
     test_pickle: str = "test_sessions_processed.pkl"
@@ -57,6 +65,9 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
 def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
@@ -76,7 +87,8 @@ def get_device() -> torch.device:
 
 
 def safe_load_pickle(path: str):
-    if not os.path.exists(path):
+    """Load a pickle safely, raising FileNotFoundError if missing."""
+    if not Path(path).exists():
         raise FileNotFoundError(f"Missing file: {path}")
     try:
         with open(path, "rb") as f:
@@ -86,6 +98,9 @@ def safe_load_pickle(path: str):
         raise RuntimeError(f"Could not load pickle: {path}") from e
 
 
+# ---------------------------------------------------------------------
+# Data preparation
+# ---------------------------------------------------------------------
 @dataclass(frozen=True)
 class Windows:
     """[N, T, F] windows and [N] integer labels."""
@@ -115,8 +130,12 @@ def extract_sliding_windows(
     return Windows(X=X, y=y)
 
 
+# ---------------------------------------------------------------------
+# Model definition
+# ---------------------------------------------------------------------
 class LstmModel(nn.Module):
     """LSTM binary classifier outputting a single logit per window."""
+
     def __init__(
         self,
         in_channels: int,
@@ -144,6 +163,9 @@ class LstmModel(nn.Module):
         return self.head(out[:, -1, :]).squeeze(-1)
 
 
+# ---------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
@@ -171,7 +193,7 @@ def _safe_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int,
 
 
 def metrics_from_probs(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> Dict[str, float]:
-    """Point metrics at τ plus threshold-free companions."""
+    """Compute metrics at threshold τ plus threshold-free scores."""
     y_pred = (y_prob >= thr).astype(int)
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
@@ -181,16 +203,16 @@ def metrics_from_probs(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> Di
     roc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
     tn, fp, fn, tp = _safe_confusion_matrix(y_true, y_pred)
     return {
-        "accuracy_at_thr": float(acc),
-        "precision_at_thr": float(prec),
-        "recall_at_thr": float(rec),
-        "f1_at_thr": float(f1),
-        "pr_auc": float(pr_auc),
-        "roc_auc": float(roc),
-        "TP": float(tp),
-        "FP": float(fp),
-        "TN": float(tn),
-        "FN": float(fn),
+        "accuracy_at_thr": acc,
+        "precision_at_thr": prec,
+        "recall_at_thr": rec,
+        "f1_at_thr": f1,
+        "pr_auc": pr_auc,
+        "roc_auc": roc,
+        "TP": tp,
+        "FP": fp,
+        "TN": tn,
+        "FN": fn,
     }
 
 
@@ -213,21 +235,24 @@ def threshold_sensitivity(
     return rows
 
 
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 def main() -> None:
-    """Evaluate all 'best_*.pt' on the TEST set at τ, and sort by F1@τ."""
+    """Evaluate all 'best_*.pt' models on the TEST set at τ and sort by F1@τ."""
     cfg = Settings()
     setup_logging(cfg.log_level)
     set_seed(cfg.seed)
     device = get_device()
     logging.info("Device: %s", device)
 
-    cfg_path = os.path.join(cfg.data_dir, cfg.cfg_pickle)
-    test_path = os.path.join(cfg.data_dir, cfg.test_pickle)
-    config = safe_load_pickle(cfg_path)
-    test_sess = safe_load_pickle(test_path)
+    cfg_path = Path(cfg.data_dir) / cfg.cfg_pickle
+    test_path = Path(cfg.data_dir) / cfg.test_pickle
+    config = safe_load_pickle(str(cfg_path))
+    test_sess = safe_load_pickle(str(test_path))
 
     if not isinstance(config, dict) or "stoi" not in config:
-        raise KeyError("Config pickle must be a dict containing the key 'stoi'.")
+        raise KeyError("Config pickle must contain the key 'stoi'.")
 
     win_test = extract_sliding_windows(test_sess, cfg.window_length)
     pin_mem = torch.cuda.is_available()
@@ -244,7 +269,7 @@ def main() -> None:
     )
 
     pattern = re.compile(cfg.filename_pattern)
-    model_files = sorted(glob.glob(os.path.join(cfg.models_dir, "best_*.pt")))
+    model_files = sorted(Path(cfg.models_dir).glob("best_*.pt"))
     logging.info("Found %d model files in %s", len(model_files), cfg.models_dir)
 
     in_channels = len(config["stoi"])
@@ -253,15 +278,14 @@ def main() -> None:
     last_true: np.ndarray = np.array([])
 
     for path in model_files:
-        fname = os.path.basename(path)
-        m = pattern.search(fname)
+        m = pattern.search(path.name)
         if not m:
-            logging.warning("Skipping file with unexpected name: %s", fname)
+            logging.warning("Skipping unexpected file: %s", path.name)
             continue
         mask_prob, noise_std, feat_drop = map(float, m.groups())
         logging.info(
             "Evaluating %s (mask=%.2f noise=%.2f drop=%.2f) at τ=%.2f",
-            fname, mask_prob, noise_std, feat_drop, cfg.fixed_threshold,
+            path.name, mask_prob, noise_std, feat_drop, cfg.fixed_threshold,
         )
 
         model = LstmModel(
@@ -290,35 +314,29 @@ def main() -> None:
                 "mask_prob": float(mask_prob),
                 "noise_std": float(noise_std),
                 "feature_drop_prob": float(feat_drop),
-                "ckpt": path,
+                "ckpt": str(path),
                 "threshold": float(cfg.fixed_threshold),
             }
         )
         results.append(metrics)
-
         last_probs = y_prob
         last_true = y_true
 
-    # Sort by the metric you care about at τ
     results_sorted = sorted(results, key=lambda r: r["f1_at_thr"], reverse=True)
+    Path(cfg.results_json).write_text(json.dumps(results_sorted, indent=2))
+    logging.info("Saved metrics sorted by F1@τ=%.2f → %s", cfg.fixed_threshold, cfg.results_json)
 
-    os.makedirs(os.path.dirname(cfg.results_json), exist_ok=True)
-    with open(cfg.results_json, "w") as f:
-        json.dump(results_sorted, f, indent=2)
-    logging.info("Saved metrics (sorted by F1@τ=%.2f) to %s", cfg.fixed_threshold, cfg.results_json)
-
-    # Threshold sensitivity centered on τ (±0.20 by default)
     if last_probs.size > 0:
         lo = max(0.10, cfg.fixed_threshold - 0.20)
         hi = min(0.95, cfg.fixed_threshold + 0.20)
         thresholds = [round(t, 2) for t in np.linspace(lo, hi, 9)]
         rows = threshold_sensitivity(last_true, last_probs, thresholds)
-        os.makedirs(os.path.dirname(cfg.thresholds_txt), exist_ok=True)
-        with open(cfg.thresholds_txt, "w") as f:
-            f.write("thr\tprecision\trecall\tf1_pos\tf1_macro\tyouden_j\n")
-            for thr, p, r, f1p, f1m, j in rows:
-                f.write(f"{thr:.2f}\t{p:.3f}\t{r:.3f}\t{f1p:.3f}\t{f1m:.3f}\t{j:.3f}\n")
-        logging.info("Saved threshold analysis to %s (range %.2f–%.2f).", cfg.thresholds_txt, thresholds[0], thresholds[-1])
+        Path(cfg.thresholds_txt).write_text(
+            "thr\tprecision\trecall\tf1_pos\tf1_macro\tyouden_j\n" +
+            "\n".join(f"{thr:.2f}\t{p:.3f}\t{r:.3f}\t{f1p:.3f}\t{f1m:.3f}\t{j:.3f}" 
+                      for thr, p, r, f1p, f1m, j in rows)
+        )
+        logging.info("Saved threshold analysis to %s (range %.2f–%.2f)", cfg.thresholds_txt, thresholds[0], thresholds[-1])
     else:
         logging.warning("No models evaluated; threshold analysis skipped.")
 
