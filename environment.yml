@@ -35,6 +35,11 @@ dependencies:
   - dask=2024.5.1
   - pyarrow=14.0.2
 
+  # --- Configuration / validation ---
+  - pydantic>=2.0
+  - pydantic-settings>=2.0
+  
+
   # --- Dev tools ---
   - flake8=6.1.0
   - black=24.8.0
